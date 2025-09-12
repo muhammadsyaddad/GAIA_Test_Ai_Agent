@@ -3,26 +3,79 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
-
+from langchain_community.chat_models import ChatLiteLLM
+from smolagents import LiteLLMModel
+from crewai import Agent, Task, Crew, Process
+from crewai_tools import  FileReadTool
+from duckduckgo_search import DDGS
+from crewai.tools import BaseTool
 # (Keep Constants as is)
 # --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
-class BasicAgent:
+class WebSearchTool(BaseTool):
+    name: str = "Web Search"
+    description: str = "Searches the web for information using DuckDuckGo."
+
+    def _run(self, query: str) -> str:
+        print(f"--- TOOL: Melakukan pencarian web untuk '{query}' ---")
+        try:
+            with DDGS() as ddgs:
+                results = [r for r in ddgs.text(query, max_results=5)]
+                return str(results) if results else "Tidak ada hasil ditemukan."
+        except Exception as e:
+            return f"Error saat melakukan pencarian: {e}"
+web_search_tool = WebSearchTool()
+file_read_tool = FileReadTool()
+
+class CrewAIAgent:
     def __init__(self):
-        print("BasicAgent initialized.")
+        self.model = LiteLLMModel(
+            model_id="gemini/gemini-2.0-flash-lite",
+            api_key=os.getenv("GEMINI_API_KEY")
+        )
+        self.gaia_solver = Agent(
+            role='GAIA Problem Solver',
+            goal='Accurately answer complex questions based on provided context and by using available tools',
+            backstory=(
+                "You are an expert AI assistant. You are methodical, you break down problems into steps, "
+                "and you use your available tools (like web search or file reading) to find evidence. "
+                "After you have gathered enough information, you provide the final answer directly."
+            ),
+            verbose=True,
+            allow_delegation=False,
+            tools=[web_search_tool, file_read_tool],
+            llm=self.model
+        )
+        self.crew = Crew(
+            agents=[self.gaia_solver],
+            tasks=[],
+            process=Process.sequential,
+            verbose=True
+        )
+
     def __call__(self, question: str) -> str:
-        print(f"Agent received question (first 50 chars): {question[:50]}...")
-        fixed_answer = "This is a default answer."
-        print(f"Agent returning fixed answer: {fixed_answer}")
-        return fixed_answer
+        solve_task = Task(
+            description=f"Solve the following problem: {question}",
+            expected_output="The final, concise answer to the problem.",
+            agent=self.gaia_solver
+        )
+
+        self.crew.tasks = [solve_task]
+        try:
+            answer = self.crew.kickoff()
+            return answer
+        except Exception as e:
+            print(f"---!! An error occurred during crew kickoff: {e} !!---")
+            return f"AGENT FAILED: {e}"
+
+
 
 def run_and_submit_all( profile: gr.OAuthProfile | None):
     """
     Fetches all questions, runs the BasicAgent on them, submits all answers,
     and displays the results.
     """
-    # --- Determine HF Space Runtime URL and Repo URL ---
     space_id = os.getenv("SPACE_ID") # Get the SPACE_ID for sending link to the code
 
     if profile:
@@ -38,7 +91,7 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
 
     # 1. Instantiate Agent ( modify this part to create your agent)
     try:
-        agent = BasicAgent()
+        agent = CrewAIAgent()
     except Exception as e:
         print(f"Error instantiating agent: {e}")
         return f"Error initializing agent: {e}", None
