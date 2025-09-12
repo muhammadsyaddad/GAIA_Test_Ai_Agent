@@ -4,13 +4,11 @@ import requests
 import inspect
 import pandas as pd
 from langchain_community.chat_models import ChatLiteLLM
-from smolagents import LiteLLMModel
+from langchain_google_genai import ChatGoogleGenerativeAI
 from crewai import Agent, Task, Crew, Process
 from crewai_tools import  FileReadTool
 from duckduckgo_search import DDGS
 from crewai.tools import BaseTool
-# (Keep Constants as is)
-# --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
 class WebSearchTool(BaseTool):
@@ -25,15 +23,17 @@ class WebSearchTool(BaseTool):
                 return str(results) if results else "Tidak ada hasil ditemukan."
         except Exception as e:
             return f"Error saat melakukan pencarian: {e}"
-web_search_tool = WebSearchTool()
-file_read_tool = FileReadTool()
 
 class CrewAIAgent:
     def __init__(self):
-        self.model = LiteLLMModel(
-            model_id="gemini/gemini-2.0-flash-lite",
-            api_key=os.getenv("GEMINI_API_KEY")
+        self.model = ChatLiteLLM(
+            model="gemini-1.5-flash-latest",
+            verbose=True,
+            temperature=0.5,
+            google_api_key=os.getenv("GEMINI_API_KEY")
         )
+        web_search_tool = WebSearchTool()
+        file_read_tool = FileReadTool()
         self.gaia_solver = Agent(
             role='GAIA Problem Solver',
             goal='Accurately answer complex questions based on provided context and by using available tools',
