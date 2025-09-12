@@ -3,12 +3,12 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
-from langchain_community.chat_models import ChatLiteLLM
 from langchain_google_genai import ChatGoogleGenerativeAI
 from crewai import Agent, Task, Crew, Process
-from crewai_tools import  FileReadTool
+from crewai_tools import FileReadTool
 from duckduckgo_search import DDGS
 from crewai.tools import BaseTool
+
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
 class WebSearchTool(BaseTool):
@@ -26,27 +26,43 @@ class WebSearchTool(BaseTool):
 
 class CrewAIAgent:
     def __init__(self):
-        self.model = ChatLiteLLM(
-            model="gemini-1.5-flash-latest",
+        # Solusi 1: Ubah nama model ke format yang benar untuk Google Gemini
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",  # Ubah dari "gemini-1.5-flash-latest"
             verbose=True,
             temperature=0.5,
+            max_retries=2,
+            request_timeout=30,
             google_api_key=os.getenv("GEMINI_API_KEY")
         )
+
+        # Alternatif solusi 2: Jika masih error, coba model name yang lebih spesifik
+        # self.llm = ChatGoogleGenerativeAI(
+        #     model="models/gemini-1.5-flash",
+        #     verbose=True,
+        #     temperature=0.5,
+        #     google_api_key=os.getenv("GEMINI_API_KEY")
+        # )
+
+        # Inisialisasi tools
         web_search_tool = WebSearchTool()
         file_read_tool = FileReadTool()
+
+        # Buat agent
         self.gaia_solver = Agent(
             role='GAIA Problem Solver',
-            goal='Accurately answer complex questions based on provided context and by using available tools',
+            goal='Accurately answer complex questions based on provided context and by using available tools.',
             backstory=(
                 "You are an expert AI assistant. You are methodical, you break down problems into steps, "
-                "and you use your available tools (like web search or file reading) to find evidence. "
+                "and you use your available tools like web search or file reading to find evidence. "
                 "After you have gathered enough information, you provide the final answer directly."
             ),
             verbose=True,
             allow_delegation=False,
             tools=[web_search_tool, file_read_tool],
-            llm=self.model
+            llm=self.llm
         )
+
         self.crew = Crew(
             agents=[self.gaia_solver],
             tasks=[],
@@ -63,23 +79,85 @@ class CrewAIAgent:
 
         self.crew.tasks = [solve_task]
         try:
-            answer = self.crew.kickoff()
-            return answer
+            result = self.crew.kickoff()
+            return result
         except Exception as e:
             print(f"---!! An error occurred during crew kickoff: {e} !!---")
             return f"AGENT FAILED: {e}"
 
 
+# Alternative CrewAI Agent dengan konfigurasi berbeda
+class CrewAIAgentAlternative:
+    def __init__(self):
+        # Solusi untuk tier gratis: gunakan model dengan rate limit terbaik
+        model_name = os.getenv("GOOGLE_MODEL_NAME", "gemini-1.5-flash")  # Default ke Flash
 
-def run_and_submit_all( profile: gr.OAuthProfile | None):
+        self.llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            verbose=True,
+            temperature=0.5,
+            google_api_key=os.getenv("GEMINI_API_KEY"),
+            # Optimasi untuk tier gratis
+            convert_system_message_to_human=True,
+            max_retries=2,
+            request_timeout=30
+        )
+
+        # Inisialisasi tools
+        web_search_tool = WebSearchTool()
+        file_read_tool = FileReadTool()
+
+        # Buat agent dengan error handling yang lebih baik
+        self.gaia_solver = Agent(
+            role='GAIA Problem Solver',
+            goal='Accurately answer complex questions based on provided context and by using available tools.',
+            backstory=(
+                "You are an expert AI assistant. You are methodical, you break down problems into steps, "
+                "and you use your available tools like web search or file reading to find evidence. "
+                "After you have gathered enough information, you provide the final answer directly."
+            ),
+            verbose=True,
+            allow_delegation=False,
+            tools=[web_search_tool, file_read_tool],
+            llm=self.llm
+        )
+
+        self.crew = Crew(
+            agents=[self.gaia_solver],
+            tasks=[],
+            process=Process.sequential,
+            verbose=True
+        )
+
+    def __call__(self, question: str) -> str:
+        solve_task = Task(
+            description=f"Solve the following problem: {question}",
+            expected_output="The final, concise answer to the problem.",
+            agent=self.gaia_solver
+        )
+
+        self.crew.tasks = [solve_task]
+        try:
+            # Test LLM connection terlebih dahulu
+            test_response = self.llm.invoke("Test connection")
+            print(f"LLM Test successful: {test_response}")
+
+            result = self.crew.kickoff()
+            return str(result)
+        except Exception as e:
+            print(f"---!! An error occurred during crew kickoff: {e} !!---")
+            return f"AGENT FAILED: {e}"
+
+
+def run_and_submit_all(profile: gr.OAuthProfile | None):
     """
     Fetches all questions, runs the BasicAgent on them, submits all answers,
     and displays the results.
     """
-    space_id = os.getenv("SPACE_ID") # Get the SPACE_ID for sending link to the code
+    space_id = os.getenv("SPACE_ID")
 
     if profile:
-        username= f"{profile.username}"
+        username = f"{profile.username}"
         print(f"User logged in: {username}")
     else:
         print("User not logged in.")
@@ -89,13 +167,25 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     questions_url = f"{api_url}/questions"
     submit_url = f"{api_url}/submit"
 
-    # 1. Instantiate Agent ( modify this part to create your agent)
+    # 1. Instantiate Agent dengan error handling yang lebih baik
     try:
+        # Coba agent utama terlebih dahulu
         agent = CrewAIAgent()
+        # Test agent dengan pertanyaan sederhana
+        test_result = agent("What is 2+2?")
+        if "AGENT FAILED" in test_result:
+            print("Primary agent failed, trying alternative...")
+            agent = CrewAIAgentAlternative()
     except Exception as e:
-        print(f"Error instantiating agent: {e}")
-        return f"Error initializing agent: {e}", None
-    # In the case of an app running as a hugging Face space, this link points toward your codebase ( usefull for others so please keep it public)
+        print(f"Error instantiating primary agent: {e}")
+        try:
+            print("Trying alternative agent configuration...")
+            agent = CrewAIAgentAlternative()
+        except Exception as e2:
+            print(f"Error instantiating alternative agent: {e2}")
+            return f"Error initializing both agent configurations: Primary: {e}, Alternative: {e2}", None
+
+    # Rest of the function remains the same...
     agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
     print(agent_code)
 
@@ -106,16 +196,16 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
         response.raise_for_status()
         questions_data = response.json()
         if not questions_data:
-             print("Fetched questions list is empty.")
-             return "Fetched questions list is empty or invalid format.", None
+            print("Fetched questions list is empty.")
+            return "Fetched questions list is empty or invalid format.", None
         print(f"Fetched {len(questions_data)} questions.")
     except requests.exceptions.RequestException as e:
         print(f"Error fetching questions: {e}")
         return f"Error fetching questions: {e}", None
     except requests.exceptions.JSONDecodeError as e:
-         print(f"Error decoding JSON response from questions endpoint: {e}")
-         print(f"Response text: {response.text[:500]}")
-         return f"Error decoding server response for questions: {e}", None
+        print(f"Error decoding JSON response from questions endpoint: {e}")
+        print(f"Response text: {response.text[:500]}")
+        return f"Error decoding server response for questions: {e}", None
     except Exception as e:
         print(f"An unexpected error occurred fetching questions: {e}")
         return f"An unexpected error occurred fetching questions: {e}", None
@@ -135,8 +225,8 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
             answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
         except Exception as e:
-             print(f"Error running agent on task {task_id}: {e}")
-             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+            print(f"Error running agent on task {task_id}: {e}")
+            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
 
     if not answers_payload:
         print("Agent did not produce any answers to submit.")
@@ -214,7 +304,6 @@ with gr.Blocks() as demo:
     run_button = gr.Button("Run Evaluation & Submit All Answers")
 
     status_output = gr.Textbox(label="Run Status / Submission Result", lines=5, interactive=False)
-    # Removed max_rows=10 from DataFrame constructor
     results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
 
     run_button.click(
@@ -226,7 +315,7 @@ if __name__ == "__main__":
     print("\n" + "-"*30 + " App Starting " + "-"*30)
     # Check for SPACE_HOST and SPACE_ID at startup for information
     space_host_startup = os.getenv("SPACE_HOST")
-    space_id_startup = os.getenv("SPACE_ID") # Get SPACE_ID at startup
+    space_id_startup = os.getenv("SPACE_ID")
 
     if space_host_startup:
         print(f"✅ SPACE_HOST found: {space_host_startup}")
@@ -234,7 +323,7 @@ if __name__ == "__main__":
     else:
         print("ℹ️  SPACE_HOST environment variable not found (running locally?).")
 
-    if space_id_startup: # Print repo URLs if SPACE_ID is found
+    if space_id_startup:
         print(f"✅ SPACE_ID found: {space_id_startup}")
         print(f"   Repo URL: https://huggingface.co/spaces/{space_id_startup}")
         print(f"   Repo Tree URL: https://huggingface.co/spaces/{space_id_startup}/tree/main")
