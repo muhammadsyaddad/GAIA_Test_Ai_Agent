@@ -3,6 +3,7 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
+import time
 from langchain_google_genai import ChatGoogleGenerativeAI
 from crewai import Agent, Task, Crew, Process
 from crewai_tools import FileReadTool
@@ -26,23 +27,15 @@ class WebSearchTool(BaseTool):
 
 class CrewAIAgent:
     def __init__(self):
-        # Solusi 1: Ubah nama model ke format yang benar untuk Google Gemini
+        # PERBAIKAN UTAMA: Format model name yang benar untuk Google Gemini
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",  # Ubah dari "gemini-1.5-flash-latest"
+            model="gemini-1.5-flash",  # TANPA "models/" prefix
             verbose=True,
             temperature=0.5,
+            google_api_key=os.getenv("GEMINI_API_KEY"),
             max_retries=2,
-            request_timeout=30,
-            google_api_key=os.getenv("GEMINI_API_KEY")
+            request_timeout=30
         )
-
-        # Alternatif solusi 2: Jika masih error, coba model name yang lebih spesifik
-        # self.llm = ChatGoogleGenerativeAI(
-        #     model="models/gemini-1.5-flash",
-        #     verbose=True,
-        #     temperature=0.5,
-        #     google_api_key=os.getenv("GEMINI_API_KEY")
-        # )
 
         # Inisialisasi tools
         web_search_tool = WebSearchTool()
@@ -79,35 +72,119 @@ class CrewAIAgent:
 
         self.crew.tasks = [solve_task]
         try:
+            # Tambah delay untuk rate limiting (15 RPM = 4 detik per request)
+            time.sleep(4)
+
             result = self.crew.kickoff()
-            return result
+            return str(result)
         except Exception as e:
             print(f"---!! An error occurred during crew kickoff: {e} !!---")
             return f"AGENT FAILED: {e}"
 
 
-# Alternative CrewAI Agent dengan konfigurasi berbeda
+# Alternatif dengan konfigurasi lebih eksplisit
 class CrewAIAgentAlternative:
     def __init__(self):
-        # Solusi untuk tier gratis: gunakan model dengan rate limit terbaik
-        model_name = os.getenv("GOOGLE_MODEL_NAME", "gemini-1.5-flash")  # Default ke Flash
+        # Konfigurasi yang lebih eksplisit untuk menghindari masalah litellm
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is required")
 
+        # Format model yang benar sesuai dokumentasi litellm untuk Google
         self.llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            verbose=True,
+            model="gemini-1.5-flash",  # Format standar tanpa prefix
+            google_api_key=api_key,
             temperature=0.5,
-            google_api_key=os.getenv("GEMINI_API_KEY"),
-            # Optimasi untuk tier gratis
-            convert_system_message_to_human=True,
+            verbose=True,
+            max_tokens=1000,  # Tambah limit token untuk kontrol
             max_retries=2,
-            request_timeout=30
+            request_timeout=30,
+            # Jangan gunakan parameter deprecated
         )
 
-        # Inisialisasi tools
+        # Tools
         web_search_tool = WebSearchTool()
         file_read_tool = FileReadTool()
 
-        # Buat agent dengan error handling yang lebih baik
+        self.gaia_solver = Agent(
+            role='GAIA Problem Solver',
+            goal='Accurately answer complex questions based on provided context and by using available tools.',
+            backstory=(
+                "You are an expert AI assistant. You are methodical, you break down problems into steps, "
+                "and you use your available tools like web search or file reading to find evidence. "
+                "After you have gathered enough information, you provide the final answer directly."
+            ),
+            verbose=True,
+            allow_delegation=False,
+            tools=[web_search_tool, file_read_tool],
+            llm=self.llm
+        )
+
+        self.crew = Crew(
+            agents=[self.gaia_solver],
+            tasks=[],
+            process=Process.sequential,
+            verbose=True
+        )
+
+    def test_llm_connection(self):
+        """Test LLM connection sebelum digunakan"""
+        try:
+            response = self.llm.invoke("Say hello")
+            print(f"✅ LLM Test berhasil: {response.content}")
+            return True
+        except Exception as e:
+            print(f"❌ LLM Test gagal: {e}")
+            return False
+
+    def __call__(self, question: str) -> str:
+        # Test connection dulu
+        if not self.test_llm_connection():
+            return "AGENT FAILED: LLM connection test failed"
+
+        solve_task = Task(
+            description=f"Solve the following problem: {question}",
+            expected_output="The final, concise answer to the problem.",
+            agent=self.gaia_solver
+        )
+
+        self.crew.tasks = [solve_task]
+        try:
+            # Rate limiting untuk tier gratis (15 RPM)
+            time.sleep(4)
+
+            result = self.crew.kickoff()
+            return str(result)
+        except Exception as e:
+            print(f"---!! An error occurred during crew kickoff: {e} !!---")
+            return f"AGENT FAILED: {e}"
+
+
+# Solusi fallback menggunakan OpenAI format jika Gemini masih bermasalah
+class CrewAIAgentOpenAI:
+    def __init__(self):
+        try:
+            from langchain_openai import ChatOpenAI
+
+            # Jika ada OpenAI API key, gunakan itu
+            openai_key = os.getenv("OPENAI_API_KEY")
+            if openai_key:
+                self.llm = ChatOpenAI(
+                    model="gpt-3.5-turbo",
+                    api_key=openai_key,
+                    temperature=0.5,
+                    max_tokens=1000
+                )
+            else:
+                raise ValueError("No OpenAI API key provided")
+
+        except ImportError:
+            raise ValueError("langchain_openai not installed")
+
+        # Tools
+        web_search_tool = WebSearchTool()
+        file_read_tool = FileReadTool()
+
         self.gaia_solver = Agent(
             role='GAIA Problem Solver',
             goal='Accurately answer complex questions based on provided context and by using available tools.',
@@ -138,10 +215,6 @@ class CrewAIAgentAlternative:
 
         self.crew.tasks = [solve_task]
         try:
-            # Test LLM connection terlebih dahulu
-            test_response = self.llm.invoke("Test connection")
-            print(f"LLM Test successful: {test_response}")
-
             result = self.crew.kickoff()
             return str(result)
         except Exception as e:
@@ -167,23 +240,53 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     questions_url = f"{api_url}/questions"
     submit_url = f"{api_url}/submit"
 
-    # 1. Instantiate Agent dengan error handling yang lebih baik
+    # 1. Instantiate Agent dengan multiple fallback
+    agent = None
+    agent_type = "Unknown"
+
+    # Try 1: Primary Gemini Agent
     try:
-        # Coba agent utama terlebih dahulu
+        print("🔄 Trying primary Gemini agent...")
         agent = CrewAIAgent()
-        # Test agent dengan pertanyaan sederhana
         test_result = agent("What is 2+2?")
-        if "AGENT FAILED" in test_result:
-            print("Primary agent failed, trying alternative...")
-            agent = CrewAIAgentAlternative()
+        if "AGENT FAILED" not in test_result:
+            agent_type = "Primary Gemini"
+            print("✅ Primary Gemini agent working")
+        else:
+            agent = None
     except Exception as e:
-        print(f"Error instantiating primary agent: {e}")
+        print(f"❌ Primary agent failed: {e}")
+
+    # Try 2: Alternative Gemini Agent
+    if agent is None:
         try:
-            print("Trying alternative agent configuration...")
+            print("🔄 Trying alternative Gemini agent...")
             agent = CrewAIAgentAlternative()
-        except Exception as e2:
-            print(f"Error instantiating alternative agent: {e2}")
-            return f"Error initializing both agent configurations: Primary: {e}, Alternative: {e2}", None
+            agent_type = "Alternative Gemini"
+            print("✅ Alternative Gemini agent working")
+        except Exception as e:
+            print(f"❌ Alternative Gemini agent failed: {e}")
+
+    # Try 3: OpenAI Fallback (jika tersedia)
+    if agent is None and os.getenv("OPENAI_API_KEY"):
+        try:
+            print("🔄 Trying OpenAI fallback agent...")
+            agent = CrewAIAgentOpenAI()
+            agent_type = "OpenAI Fallback"
+            print("✅ OpenAI fallback agent working")
+        except Exception as e:
+            print(f"❌ OpenAI fallback agent failed: {e}")
+
+    if agent is None:
+        return """
+        🚫 All agent configurations failed. Please check:
+        1. GEMINI_API_KEY environment variable is set correctly
+        2. API key has proper permissions
+        3. Try adding OPENAI_API_KEY as fallback
+        4. Check network connectivity
+        """, None
+
+    print(f"🎯 Using agent: {agent_type}")
 
     # Rest of the function remains the same...
     agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
@@ -204,7 +307,6 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         return f"Error fetching questions: {e}", None
     except requests.exceptions.JSONDecodeError as e:
         print(f"Error decoding JSON response from questions endpoint: {e}")
-        print(f"Response text: {response.text[:500]}")
         return f"Error decoding server response for questions: {e}", None
     except Exception as e:
         print(f"An unexpected error occurred fetching questions: {e}")
@@ -213,19 +315,24 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     # 3. Run your Agent
     results_log = []
     answers_payload = []
-    print(f"Running agent on {len(questions_data)} questions...")
-    for item in questions_data:
+    print(f"Running {agent_type} agent on {len(questions_data)} questions...")
+
+    for i, item in enumerate(questions_data):
         task_id = item.get("task_id")
         question_text = item.get("question")
         if not task_id or question_text is None:
             print(f"Skipping item with missing task_id or question: {item}")
             continue
+
+        print(f"🔄 Processing question {i+1}/{len(questions_data)}: {task_id}")
+
         try:
             submitted_answer = agent(question_text)
             answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
+            print(f"✅ Question {i+1} completed")
         except Exception as e:
-            print(f"Error running agent on task {task_id}: {e}")
+            print(f"❌ Error running agent on task {task_id}: {e}")
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
 
     if not answers_payload:
@@ -234,7 +341,7 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
 
     # 4. Prepare Submission
     submission_data = {"username": username.strip(), "agent_code": agent_code, "answers": answers_payload}
-    status_update = f"Agent finished. Submitting {len(answers_payload)} answers for user '{username}'..."
+    status_update = f"{agent_type} agent finished. Submitting {len(answers_payload)} answers for user '{username}'..."
     print(status_update)
 
     # 5. Submit
@@ -245,6 +352,7 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         result_data = response.json()
         final_status = (
             f"Submission Successful!\n"
+            f"Agent Used: {agent_type}\n"
             f"User: {result_data.get('username')}\n"
             f"Overall Score: {result_data.get('score', 'N/A')}% "
             f"({result_data.get('correct_count', '?')}/{result_data.get('total_attempted', '?')} correct)\n"
@@ -253,29 +361,8 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         print("Submission successful.")
         results_df = pd.DataFrame(results_log)
         return final_status, results_df
-    except requests.exceptions.HTTPError as e:
-        error_detail = f"Server responded with status {e.response.status_code}."
-        try:
-            error_json = e.response.json()
-            error_detail += f" Detail: {error_json.get('detail', e.response.text)}"
-        except requests.exceptions.JSONDecodeError:
-            error_detail += f" Response: {e.response.text[:500]}"
-        status_message = f"Submission Failed: {error_detail}"
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
-    except requests.exceptions.Timeout:
-        status_message = "Submission Failed: The request timed out."
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
-    except requests.exceptions.RequestException as e:
-        status_message = f"Submission Failed: Network error - {e}"
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
     except Exception as e:
-        status_message = f"An unexpected error occurred during submission: {e}"
+        status_message = f"Submission Failed: {e}"
         print(status_message)
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
@@ -283,27 +370,33 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
 
 # --- Build Gradio Interface using Blocks ---
 with gr.Blocks() as demo:
-    gr.Markdown("# Basic Agent Evaluation Runner")
+    gr.Markdown("# CrewAI Agent Evaluation Runner")
     gr.Markdown(
         """
         **Instructions:**
 
-        1.  Please clone this space, then modify the code to define your agent's logic, the tools, the necessary packages, etc ...
-        2.  Log in to your Hugging Face account using the button below. This uses your HF username for submission.
-        3.  Click 'Run Evaluation & Submit All Answers' to fetch questions, run your agent, submit answers, and see the score.
+        1. **Set Environment Variables** (di Hugging Face Space Settings):
+           - `GEMINI_API_KEY`: Your Google AI Studio API key (free)
+           - `OPENAI_API_KEY`: Optional OpenAI key as fallback
+
+        2. **Login**: Use the button below to login with your Hugging Face account
+
+        3. **Run**: Click 'Run Evaluation & Submit All Answers'
+
+        **Model Info:**
+        - Primary: Google Gemini 1.5 Flash (Free tier: 15 RPM)
+        - Fallback: OpenAI GPT-3.5-turbo (if API key provided)
 
         ---
-        **Disclaimers:**
-        Once clicking on the "submit button, it can take quite some time ( this is the time for the agent to go through all the questions).
-        This space provides a basic setup and is intentionally sub-optimal to encourage you to develop your own, more robust solution. For instance for the delay process of the submit button, a solution could be to cache the answers and submit in a seperate action or even to answer the questions in async.
+        **Note:** Processing takes time due to rate limiting (4 seconds per question for free tier).
         """
     )
 
     gr.LoginButton()
 
-    run_button = gr.Button("Run Evaluation & Submit All Answers")
+    run_button = gr.Button("Run Evaluation & Submit All Answers", variant="primary")
 
-    status_output = gr.Textbox(label="Run Status / Submission Result", lines=5, interactive=False)
+    status_output = gr.Textbox(label="Run Status / Submission Result", lines=7, interactive=False)
     results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
 
     run_button.click(
@@ -312,25 +405,28 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
-    print("\n" + "-"*30 + " App Starting " + "-"*30)
-    # Check for SPACE_HOST and SPACE_ID at startup for information
-    space_host_startup = os.getenv("SPACE_HOST")
-    space_id_startup = os.getenv("SPACE_ID")
+    print("\n" + "="*50)
+    print("🚀 CrewAI Agent with Google Gemini")
+    print("="*50)
 
-    if space_host_startup:
-        print(f"✅ SPACE_HOST found: {space_host_startup}")
-        print(f"   Runtime URL should be: https://{space_host_startup}.hf.space")
+    # Check environment variables
+    if os.getenv("GEMINI_API_KEY"):
+        print("✅ GEMINI_API_KEY found")
     else:
-        print("ℹ️  SPACE_HOST environment variable not found (running locally?).")
+        print("❌ GEMINI_API_KEY not found - please set this environment variable")
 
-    if space_id_startup:
-        print(f"✅ SPACE_ID found: {space_id_startup}")
-        print(f"   Repo URL: https://huggingface.co/spaces/{space_id_startup}")
-        print(f"   Repo Tree URL: https://huggingface.co/spaces/{space_id_startup}/tree/main")
+    if os.getenv("OPENAI_API_KEY"):
+        print("✅ OPENAI_API_KEY found (fallback available)")
     else:
-        print("ℹ️  SPACE_ID environment variable not found (running locally?). Repo URL cannot be determined.")
+        print("ℹ️  OPENAI_API_KEY not found (no fallback)")
 
-    print("-"*(60 + len(" App Starting ")) + "\n")
+    space_id = os.getenv("SPACE_ID")
+    if space_id:
+        print(f"✅ SPACE_ID: {space_id}")
+    else:
+        print("ℹ️  Running locally")
 
-    print("Launching Gradio Interface for Basic Agent Evaluation...")
+    print("="*50 + "\n")
+
+    print("Launching Gradio Interface...")
     demo.launch(debug=True, share=False)
